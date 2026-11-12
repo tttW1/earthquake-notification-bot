@@ -2,6 +2,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -15,6 +16,8 @@ INTENSITY = {
     "1": "1", "2": "2", "3": "3", "4": "4",
     "5-": "5弱", "5+": "5強", "6-": "6弱", "6+": "6強", "7": "7",
 }
+STATE_FILE = "sent_ids.json"
+MAX_STATE = 300
 TIMEOUT = 20
 USER_AGENT = "earthquake-notification-bot/1.0"
 
@@ -52,6 +55,11 @@ def strip_namespaces(root):
             el.tag = el.tag.split("}", 1)[1]
 
 
+def normalize(value):
+    """全角の英数字を半角にそろえる（Ｍ３．９ → M3.9）。"""
+    return unicodedata.normalize("NFKC", value)
+
+
 def parse_report(xml_bytes):
     """電文XMLから必要な項目を取り出す。無い項目は空文字にする。"""
     root = ET.fromstring(xml_bytes)
@@ -59,17 +67,17 @@ def parse_report(xml_bytes):
 
     def text(path):
         value = root.findtext(path)
-        return value.strip() if value else ""
+        return normalize(value.strip()) if value else ""
 
     magnitude = ""
     mag = root.find("Body/Earthquake/Magnitude")
     if mag is not None:
-        magnitude = (mag.get("description") or mag.text or "").strip()
+        magnitude = normalize((mag.get("description") or mag.text or "").strip())
 
     depth = ""
     coord = root.find("Body/Earthquake/Hypocenter/Area/Coordinate")
     if coord is not None:
-        m = re.search(r"深さ\s*(.+)$", coord.get("description", ""))
+        m = re.search(r"深さ\s*(.+)$", normalize(coord.get("description", "")))
         if m:
             depth = m.group(1).strip()
 
@@ -114,6 +122,24 @@ def build_message(title, info):
     return "\n".join(lines)
 
 
+def load_state():
+    """送信済みの電文URLのリストを返す。ファイルが無ければ None（初回実行）。"""
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError):
+        print("記録ファイルが読めないため、空として扱います。")
+        return []
+
+
+def save_state(sent):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(sent[-MAX_STATE:], f, ensure_ascii=False, indent=0)
+
+
 def send_telegram(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -140,16 +166,6 @@ def send_telegram(text):
 def main():
     try:
         entries = get_earthquake_entries()
-        if not entries:
-            print("フィードに対象の地震情報がありません。")
-            return 0
-
-        latest = entries[0]
-        if not latest["link"].startswith(ALLOWED_PREFIX):
-            print("想定外のURLのため中止しました。")
-            return 1
-
-        info = parse_report(http_get(latest["link"]))
     except urllib.error.HTTPError as e:
         print(f"気象庁がエラーを返しました: {e.code}")
         return 1
@@ -157,14 +173,42 @@ def main():
         print("気象庁に接続できませんでした。")
         return 1
     except ET.ParseError:
-        print("XMLの解析に失敗しました。")
+        print("フィードの解析に失敗しました。")
         return 1
 
-    message = build_message(latest["title"], info)
-    print(message)
-    ok = send_telegram(message)
-    print("送信成功" if ok else "送信失敗")
-    return 0 if ok else 1
+    sent = load_state()
+    if sent is None:
+        print("初回実行：最新1件のみ通知し、残りは記録だけします。")
+        targets = entries[:1]
+        sent = [e["link"] for e in entries[1:]]
+    else:
+        # 古い順に並べ、未送信のものだけを対象にする
+        targets = [e for e in reversed(entries) if e["link"] not in sent]
+
+    failed = False
+    for e in targets:
+        if not e["link"].startswith(ALLOWED_PREFIX):
+            print("想定外のURLをスキップしました。")
+            sent.append(e["link"])
+            continue
+        try:
+            info = parse_report(http_get(e["link"]))
+        except (urllib.error.URLError, ET.ParseError):
+            print("電文の取得または解析に失敗しました。次回再試行します。")
+            failed = True
+            continue
+
+        message = build_message(e["title"], info)
+        print(message)
+        print()
+        if send_telegram(message):
+            sent.append(e["link"])
+        else:
+            failed = True
+
+    save_state(sent)
+    print(f"未送信の電文：{len(targets)}件を処理しました。")
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
